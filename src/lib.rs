@@ -117,21 +117,33 @@ pub fn start_or_attach(command:&mut Command, port:u16) {
                     let par_alive = unsafe { libc::kill(ppid, 0) } == 0;
                     println!("pworker state: {:?}; par alive: {}", state, par_alive);
 
-                    match state {
-                        PWorkerState::JustLaunched if par_alive => state = PWorkerState::Connected,
-                        PWorkerState::Disconnected(_) if par_alive => state = PWorkerState::Connected,
-                        PWorkerState::Disconnected(n) if n > 0 => state = PWorkerState::Disconnected(n-1),
-                        PWorkerState::Disconnected(0) => {
-                            unsafe {
-                                if let FollowerState::Spawned(pid) = fstate {
-                                    println!("killing follower");
-                                    libc::kill(pid as i32, libc::SIGTERM);
+                    // break out the alive/nonalive cases so that I can have a straightforward
+                    // explicit-case match for each without excessive guard clauses
+                    state = if par_alive {
+                        match state {
+                            PWorkerState::Connected => state,
+                            PWorkerState::Disconnected(_)
+                            | PWorkerState::JustLaunched => PWorkerState::Connected
+                        }
+                    } else {
+                        // parent disconnected
+                        match state {
+                            PWorkerState::JustLaunched
+                            | PWorkerState::Connected => PWorkerState::Disconnected(10),
+                            PWorkerState::Disconnected(n) if n > 0 => PWorkerState::Disconnected(n-1),
+                            PWorkerState::Disconnected(0) => {
+                                unsafe {
+                                    if let FollowerState::Spawned(pid) = fstate {
+                                        println!("killing follower");
+                                        libc::kill(pid as i32, libc::SIGTERM);
+                                    }
+                                    println!("pworker complete");
+                                    libc::exit(0);
                                 }
-                                println!("pworker complete");
-                                libc::exit(0);
-                            }
-                        },
-                        _ => if !par_alive { state = PWorkerState::Disconnected(10) },
+                            },
+                            // this is an illegal state, reset to something legal
+                            PWorkerState::Disconnected(_) => PWorkerState::Disconnected(0)
+                        }
                     };
 
                     if let PWorkerState::Connected = state {
