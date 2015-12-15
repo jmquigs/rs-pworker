@@ -1,21 +1,20 @@
 extern crate libc;
 extern crate hyper;
-extern crate civet;
-extern crate conduit;
 
-use std::collections::HashMap;
 use std::io;
 use std::sync::mpsc::channel;
 use std::thread;
 use std::time;
 use std::process::Command;
 use std::sync::Mutex;
+use std::net::SocketAddr;
 
-use civet::{Config, response, Server};
-use conduit::{Request, Response};
-
-use self::hyper::Client;
-use self::hyper::header::Connection;
+use hyper::{Client,Server};
+use hyper::header::Connection;
+use hyper::server::Request;
+use hyper::server::Response;
+use hyper::uri::RequestUri;
+use hyper::header;
 
 #[derive(Debug)]
 enum PWorkerState {
@@ -55,7 +54,6 @@ pub fn start_or_attach(command:&mut Command, port:u16) {
     }
 
     // start the pworker
-
     let pid = unsafe { libc::fork() };
     match pid {
         -1 => panic!("fork error"),
@@ -72,12 +70,11 @@ pub fn start_or_attach(command:&mut Command, port:u16) {
 
                 let h_tx = Mutex::new(tx.clone());
 
-                let hb_handler = move |req: &mut Request| -> io::Result<Response> {
-                    match req.query_string() {
-                        None => (),
-                        Some(qs) => {
-                            if qs.contains("parent_pid=") {
-                                let res = qs.split("parent_pid=");
+                let hb_handler = move |req: Request, mut res: Response| {
+                    match req.uri {
+                        RequestUri::AbsolutePath(p) => {
+                            if p.contains("parent_pid=") {
+                                let res = p.split("parent_pid=");
                                 let vec:Vec<&str> = res.collect();
                                 if vec.len() == 2 {
                                     let new_pid = vec[1].parse::<i32>().unwrap();
@@ -85,19 +82,28 @@ pub fn start_or_attach(command:&mut Command, port:u16) {
                                     l_tx.send(new_pid).unwrap();
                                 }
                             }
-                        }
+                        },
+                        x => panic!("bizzaro request: {}", x)
                     }
 
-                    let mut headers:HashMap<String,Vec<String>> = HashMap::new();
-                    // close conn since we don't have many handlers
-                    headers.insert("Connection".to_owned(), vec!["Close".to_owned()]);
+                    {
+                        // close conn to avoid handler overload
+                        let headers = res.headers_mut();
+                        headers.set(header::Connection(vec![header::ConnectionOption::Close]));
+                    }
 
-                    Ok(response(200, headers, "PWorker running".as_bytes()))
+                    let _ = res.send("PWorker running".as_bytes());
                 };
 
-                let mut cfg = Config::new();
-                cfg.port(port).threads(1);
-                let _server = Server::start(cfg, hb_handler);
+                thread::spawn(move || {
+                    println!("starting pworker server");
+                    let s_str = format!("127.0.0.1:{}", port);
+                    let server: SocketAddr = s_str.parse().unwrap();
+                    match Server::http(server).unwrap().handle(hb_handler) {
+                        Err(e) => panic!("failed to start http server: {}", e),
+                        Ok(_) => ()
+                    }
+                });
 
                 let mut state = PWorkerState::JustLaunched;
                 let mut fstate = FollowerState::NotSpawned;
