@@ -2,12 +2,13 @@ extern crate libc;
 extern crate hyper;
 
 use std::io;
-use std::sync::mpsc::channel;
+use std::sync::mpsc::{channel,Sender};
 use std::thread;
 use std::time;
 use std::process::Command;
 use std::sync::Mutex;
 use std::net::SocketAddr;
+use std::net::TcpListener;
 
 use hyper::{Client,Server};
 use hyper::header::Connection;
@@ -15,7 +16,6 @@ use hyper::server::Request;
 use hyper::server::Response;
 use hyper::uri::RequestUri;
 use hyper::header;
-use hyper::net::HttpListener;
 
 #[derive(Debug)]
 enum PWorkerState {
@@ -31,6 +31,13 @@ enum FollowerState {
     Spawned(u32) // pid of spawned process
 }
 
+#[derive(Debug)]
+pub enum PWorkerResponse {
+    SpawnedNewWorker,
+    AttachedToExistingWorker,
+    GenericError(String)
+}
+
 pub fn spawn_follower(command:&mut Command) -> io::Result<u32> {
     println!("spawning follower");
     let child = command.spawn();
@@ -38,28 +45,67 @@ pub fn spawn_follower(command:&mut Command) -> io::Result<u32> {
     Ok(child.id())
 }
 
-pub fn start_or_attach(command:&mut Command, port:u16) {
+pub fn start_or_attach(command:&mut Command, port:u16, resp_tx:Sender<PWorkerResponse>) {
+    let resp_tx = resp_tx.clone();
+
     // connect to existing pworker, pass my pid
     let mut ppid = unsafe { libc::getpid() };
 
-    let pweb = format!("http://localhost:{}/?parent_pid={}", port, ppid);
-    println!("pworker url: {}", pweb);
-    let client = Client::new();
+    // do a two-part check for existing worker: first check if http port is bound
+    // by trying to bind it here, and second try to set a new parent.
+    // if the port is not bound, there is no worker, so start a new one.
+    // if it is bound, but setparent fails, its an error.
+    // if it is bound and setparent succeeds then existing worker is fine.
 
-    let res = client.get(&pweb)
-        .header(Connection::close())
-        .send();
+    let port_bound = {
+        println!("checking port");
+        let s_str = format!("127.0.0.1:{}", port);
+        let addr: SocketAddr = s_str.parse().unwrap();
+        match TcpListener::bind(addr) {
+            Err(_) => true,
+            Ok(l) => {
+                drop(l);
+                false
+            }
+        }
+    };
+    println!("port bound: {}", port_bound);
+
+    let mut client = Client::new();
+    client.set_write_timeout(Some(time::Duration::from_millis(250)));
+
+    let set_new_parent =
+        // only do this if we know port is bound, to avoid possible connection hang
+        if port_bound {
+            let pweb = format!("http://127.0.0.1:{}/?parent_pid={}", port, ppid);
+            println!("pworker url: {}", pweb);
+
+            match client.get(&pweb)
+                .header(Connection::close())
+                .send() {
+                    Err(e) => {
+                        // the port is bound but we couldn't set a new parent. error
+                        let _ = resp_tx.send(PWorkerResponse::GenericError(format!("Port bound but unable to connect to existing pworker: {}", e)));
+                        return;
+                    },
+                    Ok(_) => true
+                }
+        } else {
+            false
+        };
+    println!("set parent: {}", set_new_parent);
 
     // spawn thread to monitor pworker http server and replicate messages on
-    // channel.  do this whether we succeeded or not at setting the new parent,
-    // since if that failed we are going to start a new server.
-    // TODO: do this only if port check below succeeds?
-    {
+    // channel.  do this regardless of whether we are spawning a new pworker, since
+    // we need the monitor thread in both cases.
+    if set_new_parent || !port_bound {
+        let resp_tx = resp_tx.clone();
+
         thread::spawn(move || {
             let mut fail_count = 0;
             let max_fail = 5;
             loop {
-                let pweb = format!("http://localhost:{}/?sitrep", port);
+                let pweb = format!("http://127.0.0.1:{}/?sitrep", port);
                 let res = client.get(&pweb)
                     .header(Connection::close())
                     .send();
@@ -68,7 +114,7 @@ pub fn start_or_attach(command:&mut Command, port:u16) {
                         fail_count += 1;
                         println!("fail: new count: {}; {}", fail_count, e);
                         if fail_count > max_fail {
-                            // TODO: send failure to channel
+                            let _ = resp_tx.send(PWorkerResponse::GenericError(format!("Unable to connect to pworker after {} attempts: {}", fail_count, e)));
                             break;
                         }
                     },
@@ -80,25 +126,19 @@ pub fn start_or_attach(command:&mut Command, port:u16) {
         });
     }
 
-    if let Ok(_) = res {
-        // no need to spawn new pworker
+    if port_bound {
+        if set_new_parent {
+            let _ = resp_tx.send(PWorkerResponse::AttachedToExistingWorker);
+        }
+        // don't need new worker
+        println!("skipping worker start, port bound");
         return;
     }
 
-    // pre-qualify the port to make sure that server will be able to bind.
-    // do this before fork().
-    {
-        let s_str = format!("127.0.0.1:{}", port);
-        let addr: SocketAddr = s_str.parse().unwrap();
-        let listener =
-            match HttpListener::new(addr) {
-                Err(e) => panic!("failed to test port: {}", e),
-                Ok(l) => l
-            };
-        drop(listener);
-    }
+    // start the pworker.
+    // note: won't be able to use resp_tx after this due to the fork.
+    // the http thread will need to poll for updates and replicate them on its resp_tx.
 
-    // start the pworker
     let pid = unsafe { libc::fork() };
     match pid {
         -1 => panic!("fork error"),
@@ -125,6 +165,8 @@ pub fn start_or_attach(command:&mut Command, port:u16) {
                                     let l_tx = h_tx.lock().unwrap();
                                     l_tx.send(new_pid).unwrap();
                                 }
+                            } else {
+                                println!("unknown req: {}", p)
                             }
                         },
                         x => panic!("bizzaro request: {}", x)
@@ -145,7 +187,7 @@ pub fn start_or_attach(command:&mut Command, port:u16) {
                     let addr: SocketAddr = s_str.parse().unwrap();
                     let server = Server::http(addr).unwrap();
                     println!("starting pworker server");
-                    match server.handle_threads(hb_handler, 1) {
+                    match server.handle_threads(hb_handler, 2) {
                         Err(e) => panic!("failed to start http server: {}", e),
                         Ok(l) => l
                     }
@@ -235,6 +277,7 @@ mod tests {
     use std::env;
     use std::time;
     use std::thread;
+    use std::sync::mpsc::{channel, Sender, Receiver};
 
     fn get_testproc_path() -> PathBuf {
         let mut wd = env::current_dir().unwrap();
@@ -254,10 +297,18 @@ mod tests {
         let tp = get_testproc_path();
 
         let mut tp_command = Command::new(&tp);
-        super::start_or_attach(&mut tp_command, 16550);
+        let (tx, rx) = channel();
+        super::start_or_attach(&mut tp_command, 16550, tx);
+        let scount = 5;
+        for i in 1..scount {
+            while let Ok(m) = rx.try_recv() {
+                println!("pworker message: {:?}", m)
+            }
+            thread::sleep(time::Duration::from_millis(1000));
+        }
 
         // TODO: actually assert something once the backchannel is going
 
-        thread::sleep(time::Duration::from_millis(5000));
+
     }
 }
