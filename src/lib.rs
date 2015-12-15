@@ -53,6 +53,7 @@ pub fn start_or_attach(command:&mut Command, port:u16) {
     // spawn thread to monitor pworker http server and replicate messages on
     // channel.  do this whether we succeeded or not at setting the new parent,
     // since if that failed we are going to start a new server.
+    // TODO: do this only if port check below succeeds?
     {
         thread::spawn(move || {
             let mut fail_count = 0;
@@ -110,10 +111,9 @@ pub fn start_or_attach(command:&mut Command, port:u16) {
             if pid == 0 {
                 println!("pworker child spawned; parent pid: {}", ppid);
 
+                // add channel for http handler to communicate back to this thread
                 let (tx, rx) = channel();
-
                 let h_tx = Mutex::new(tx.clone());
-
                 let hb_handler = move |req: Request, mut res: Response| {
                     match req.uri {
                         RequestUri::AbsolutePath(p) => {
@@ -139,6 +139,7 @@ pub fn start_or_attach(command:&mut Command, port:u16) {
                     let _ = res.send("PWorker running".as_bytes());
                 };
 
+                // make http server
                 let mut server =  {
                     let s_str = format!("127.0.0.1:{}", port);
                     let addr: SocketAddr = s_str.parse().unwrap();
@@ -150,9 +151,27 @@ pub fn start_or_attach(command:&mut Command, port:u16) {
                     }
                 };
 
+                // setup termination handler
+                let mut terminate = |fstate:&FollowerState| {
+                    unsafe {
+                        if let FollowerState::Spawned(pid) = *fstate {
+                            println!("killing follower");
+                            libc::kill(pid as i32, libc::SIGTERM);
+                        }
+                        println!("pworker complete");
+                        // its important to close the port on the http server, otherwise
+                        // we may not be able to rebind successfully if we restart (osx)
+                        let _ = server.close();
+                        thread::sleep(time::Duration::from_millis(1000));
+
+                        libc::exit(0);
+                    }
+                };
+
+                // setup initial pworker state
                 let mut state = PWorkerState::JustLaunched;
                 let mut fstate = FollowerState::NotSpawned;
-
+                
                 loop {
                     while let Ok(new_pid) = rx.try_recv() {
                         println!("got new pid: {}", new_pid);
@@ -176,21 +195,7 @@ pub fn start_or_attach(command:&mut Command, port:u16) {
                             PWorkerState::JustLaunched
                             | PWorkerState::Connected => PWorkerState::Disconnected(5),
                             PWorkerState::Disconnected(n) if n > 0 => PWorkerState::Disconnected(n-1),
-                            PWorkerState::Disconnected(0) => {
-                                unsafe {
-                                    if let FollowerState::Spawned(pid) = fstate {
-                                        println!("killing follower");
-                                        libc::kill(pid as i32, libc::SIGTERM);
-                                    }
-                                    println!("pworker complete");
-                                    // its important to close the port on the http server, otherwise
-                                    // we may not be able to rebind successfully if we restart (osx)
-                                    let _ = server.close();
-                                    thread::sleep(time::Duration::from_millis(1000));
-
-                                    libc::exit(0);
-                                }
-                            },
+                            PWorkerState::Disconnected(0) => terminate(&fstate),
                             // this is an illegal state, reset to something legal
                             PWorkerState::Disconnected(_) => PWorkerState::Disconnected(0)
                         }
