@@ -15,12 +15,14 @@ use hyper::server::Request;
 use hyper::server::Response;
 use hyper::uri::RequestUri;
 use hyper::header;
+use hyper::net::HttpListener;
 
 #[derive(Debug)]
 enum PWorkerState {
     JustLaunched,
     Connected,
-    Disconnected (u32) // time remaining in seconds before exit
+    Disconnected (u32), // time remaining in seconds before exit
+    //Dead
 }
 
 #[derive(Debug)]
@@ -48,9 +50,51 @@ pub fn start_or_attach(command:&mut Command, port:u16) {
         .header(Connection::close())
         .send();
 
-    match res {
-        Ok(_) => return, // pworker alive, we're done here
-        _ => ()
+    // spawn thread to monitor pworker http server and replicate messages on
+    // channel.  do this whether we succeeded or not at setting the new parent,
+    // since if that failed we are going to start a new server.
+    {
+        thread::spawn(move || {
+            let mut fail_count = 0;
+            let max_fail = 5;
+            loop {
+                let pweb = format!("http://localhost:{}/?sitrep", port);
+                let res = client.get(&pweb)
+                    .header(Connection::close())
+                    .send();
+                match res {
+                    Err(e) => {
+                        fail_count += 1;
+                        println!("fail: new count: {}; {}", fail_count, e);
+                        if fail_count > max_fail {
+                            // TODO: send failure to channel
+                            break;
+                        }
+                    },
+                    Ok(_) => fail_count = 0
+                }
+
+                thread::sleep(time::Duration::from_millis(1000));
+            }
+        });
+    }
+
+    if let Ok(_) = res {
+        // no need to spawn new pworker
+        return;
+    }
+
+    // pre-qualify the port to make sure that server will be able to bind.
+    // do this before fork().
+    {
+        let s_str = format!("127.0.0.1:{}", port);
+        let addr: SocketAddr = s_str.parse().unwrap();
+        let listener =
+            match HttpListener::new(addr) {
+                Err(e) => panic!("failed to test port: {}", e),
+                Ok(l) => l
+            };
+        drop(listener);
     }
 
     // start the pworker
@@ -95,15 +139,16 @@ pub fn start_or_attach(command:&mut Command, port:u16) {
                     let _ = res.send("PWorker running".as_bytes());
                 };
 
-                thread::spawn(move || {
-                    println!("starting pworker server");
+                let mut server =  {
                     let s_str = format!("127.0.0.1:{}", port);
-                    let server: SocketAddr = s_str.parse().unwrap();
-                    match Server::http(server).unwrap().handle(hb_handler) {
+                    let addr: SocketAddr = s_str.parse().unwrap();
+                    let server = Server::http(addr).unwrap();
+                    println!("starting pworker server");
+                    match server.handle_threads(hb_handler, 1) {
                         Err(e) => panic!("failed to start http server: {}", e),
-                        Ok(_) => ()
+                        Ok(l) => l
                     }
-                });
+                };
 
                 let mut state = PWorkerState::JustLaunched;
                 let mut fstate = FollowerState::NotSpawned;
@@ -129,7 +174,7 @@ pub fn start_or_attach(command:&mut Command, port:u16) {
                         // parent disconnected
                         match state {
                             PWorkerState::JustLaunched
-                            | PWorkerState::Connected => PWorkerState::Disconnected(10),
+                            | PWorkerState::Connected => PWorkerState::Disconnected(5),
                             PWorkerState::Disconnected(n) if n > 0 => PWorkerState::Disconnected(n-1),
                             PWorkerState::Disconnected(0) => {
                                 unsafe {
@@ -138,6 +183,13 @@ pub fn start_or_attach(command:&mut Command, port:u16) {
                                         libc::kill(pid as i32, libc::SIGTERM);
                                     }
                                     println!("pworker complete");
+                                    // its important to close the port on the http server, otherwise
+                                    // we may not be able to rebind successfully if we restart (osx)
+                                    let _ = server.close();
+                                    thread::sleep(time::Duration::from_millis(1000));
+
+                                    let pid = libc::getpid();
+                                    libc::kill(pid, libc::SIGTERM);
                                     libc::exit(0);
                                 }
                             },
@@ -159,7 +211,7 @@ pub fn start_or_attach(command:&mut Command, port:u16) {
                 }
             }
             else {
-                // exit remnant from double-fork
+                // exit on error, or remnant from double-fork
                 unsafe {libc::exit(0)};
             }
         },
