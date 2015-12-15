@@ -1,0 +1,12 @@
+[package]
+name = "pworker"
+version = "0.1.0"
+authors = ["John Quigley <jmquigs@gmail.com>"]
+
+[dependencies]
+conduit= "*"
+conduit-static = "*"
+conduit-router = "*"
+civet = "*"
+libc = "*"
+hyper = "*"
