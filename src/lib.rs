@@ -171,22 +171,25 @@ pub fn start_or_attach(command:&mut Command, port:u16) {
                 // setup initial pworker state
                 let mut state = PWorkerState::JustLaunched;
                 let mut fstate = FollowerState::NotSpawned;
-                
+
                 loop {
                     while let Ok(new_pid) = rx.try_recv() {
                         println!("got new pid: {}", new_pid);
                         ppid = new_pid;
                     };
 
+                    // kill with signal 0 to check to see if ppid is alive
                     let par_alive = unsafe { libc::kill(ppid, 0) } == 0;
                     println!("pworker state: {:?}; par alive: {}", state, par_alive);
 
+                    // update state.
                     // break out the alive/nonalive cases so that I can have a straightforward
-                    // explicit-case match for each without excessive guard clauses
+                    // explicit-case match for each, without excessive guard clauses
                     state = if par_alive {
                         match state {
-                            PWorkerState::Connected => state,
-                            PWorkerState::Disconnected(_)
+                            // always reset to connected if parent alive
+                            PWorkerState::Connected
+                            | PWorkerState::Disconnected(_)
                             | PWorkerState::JustLaunched => PWorkerState::Connected
                         }
                     } else {
@@ -201,6 +204,7 @@ pub fn start_or_attach(command:&mut Command, port:u16) {
                         }
                     };
 
+                    // spawn the follower if its ok to do so
                     if let PWorkerState::Connected = state {
                         if let FollowerState::NotSpawned = fstate {
                             match spawn_follower(command) {
