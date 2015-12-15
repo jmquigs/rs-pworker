@@ -188,8 +188,6 @@ pub fn start_or_attach(command:&mut Command, port:u16) {
                                     let _ = server.close();
                                     thread::sleep(time::Duration::from_millis(1000));
 
-                                    let pid = libc::getpid();
-                                    libc::kill(pid, libc::SIGTERM);
                                     libc::exit(0);
                                 }
                             },
