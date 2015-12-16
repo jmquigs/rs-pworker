@@ -18,7 +18,7 @@ use hyper::uri::RequestUri;
 use hyper::header;
 
 #[derive(Debug)]
-enum PWorkerState {
+pub enum PWorkerState {
     JustLaunched,
     Connected,
     Disconnected (u32), // time remaining in seconds before exit
@@ -26,14 +26,14 @@ enum PWorkerState {
 }
 
 #[derive(Debug)]
-enum FollowerState {
+pub enum FollowerState {
     NotSpawned,
     Spawned(u32) // pid of spawned process
 }
 
 #[derive(Debug)]
 pub enum PWorkerResponse {
-    SpawnedNewWorker,
+    WorkerAlive(PWorkerState,FollowerState),
     AttachedToExistingWorker,
     GenericError(String)
 }
