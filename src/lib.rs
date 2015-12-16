@@ -1,7 +1,9 @@
 extern crate libc;
 extern crate hyper;
+extern crate rustc_serialize;
 
 use std::io;
+use std::io::Read;
 use std::sync::Arc;
 use std::sync::mpsc::{channel,Sender};
 use std::thread;
@@ -19,22 +21,24 @@ use hyper::server::Response;
 use hyper::uri::RequestUri;
 use hyper::header;
 
-#[derive(Debug,Clone)]
+use rustc_serialize::json;
+
+#[derive(Debug,Clone,RustcDecodable,RustcEncodable,PartialEq)]
 pub enum PWorkerState {
     JustLaunched,
     Connected (i32),
     Disconnected (u32), // time remaining in seconds before exit
-    //Dead
 }
 
-#[derive(Debug,Clone)]
+#[derive(Debug,Clone,RustcDecodable,RustcEncodable,PartialEq)]
 pub enum FollowerState {
     NotSpawned,
     Spawned(u32) // pid of spawned process
 }
 
-#[derive(Debug,Clone)]
+#[derive(Debug,Clone,RustcDecodable,RustcEncodable,PartialEq)]
 pub enum PWorkerResponse {
+    NoResponseYet,
     WorkerAlive(PWorkerState,FollowerState),
     AttachedToExistingWorker,
     GenericError(String)
@@ -104,8 +108,10 @@ pub fn start_or_attach(command:&mut Command, port:u16, resp_tx:Sender<PWorkerRes
         let resp_tx = resp_tx.clone();
 
         thread::spawn(move || {
-            let mut fail_count = 0;
             let max_fail = 5;
+            let mut fail_count = 0;
+            let mut last_resp = PWorkerResponse::NoResponseYet;
+
             loop {
                 let pweb = format!("http://127.0.0.1:{}/?sitrep", port);
                 let res = client.get(&pweb)
@@ -120,7 +126,20 @@ pub fn start_or_attach(command:&mut Command, port:u16, resp_tx:Sender<PWorkerRes
                             break;
                         }
                     },
-                    Ok(_) => fail_count = 0
+                    Ok(res) => {
+                        fail_count = 0;
+                        let mut body = String::new();
+                        let mut res = res;
+                        res.read_to_string(&mut body).unwrap();
+                        let new_state: PWorkerResponse = json::decode(&body).unwrap();
+
+                        if new_state != last_resp {
+                            //println!("hresp, newstate: {:?}", new_state);
+                            last_resp = new_state;
+                            let _ = resp_tx.send(last_resp.clone());
+                        }
+                    }
+
                 }
 
                 thread::sleep(time::Duration::from_millis(1000));
@@ -184,13 +203,19 @@ pub fn start_or_attach(command:&mut Command, port:u16, resp_tx:Sender<PWorkerRes
                         headers.set(header::Connection(vec![header::ConnectionOption::Close]));
                     }
 
+                    // send the worker state as the reploy for each request
+                    // note the parent pid, if changed, won't reflect the new value until
+                    // the pworker thread updates.
                     let state = h_state.lock().ok().expect("failed to lock state in handler");
                     let fstate = h_fstate.lock().ok().expect("failed to lock fstate in handler");
 
                     let ws = PWorkerResponse::WorkerAlive((*(*state)).clone() ,(*(*fstate)).clone());
-                    println!("handler ws: {:?}", ws);
 
-                    let _ = res.send("PWorker running".as_bytes());
+                    let encoded = json::encode(&ws).unwrap();
+
+                    //println!("handler ws: {:?}", ws);
+
+                    let _ = res.send(encoded.as_bytes());
                 };
 
                 // make http server
@@ -230,7 +255,7 @@ pub fn start_or_attach(command:&mut Command, port:u16, resp_tx:Sender<PWorkerRes
 
                     // kill with signal 0 to check to see if ppid is alive
                     let par_alive = unsafe { libc::kill(ppid, 0) } == 0;
-                    println!("pworker state: {:?}; par alive: {}", state, par_alive);
+                    //println!("pworker state: {:?}; par alive: {}", state, par_alive);
 
                     // clone the states to make the check logic easier to deal with
                     let old_fstate = *(fstate.lock().ok().expect("Failed to lock fstate prior to state update")).clone();

@@ -6,3 +6,4 @@ authors = ["John Quigley <jmquigs@gmail.com>"]
 [dependencies]
 libc = "*"
 hyper = "*"
+rustc-serialize = "*"
