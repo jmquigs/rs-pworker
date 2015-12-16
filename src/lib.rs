@@ -22,7 +22,7 @@ use hyper::header;
 #[derive(Debug,Clone)]
 pub enum PWorkerState {
     JustLaunched,
-    Connected,
+    Connected (i32),
     Disconnected (u32), // time remaining in seconds before exit
     //Dead
 }
@@ -154,8 +154,8 @@ pub fn start_or_attach(command:&mut Command, port:u16, resp_tx:Sender<PWorkerRes
                 println!("pworker child spawned; parent pid: {}", ppid);
 
                 // setup initial pworker state
-                let mut state = Arc::new(Box::new(PWorkerState::JustLaunched));
-                let mut fstate = Arc::new(Box::new(FollowerState::NotSpawned));
+                let state = Arc::new(Mutex::new(Box::new(PWorkerState::JustLaunched)));
+                let fstate = Arc::new(Mutex::new(Box::new(FollowerState::NotSpawned)));
 
                 // add channel for http handler to communicate back to this thread
                 let (tx, rx) = channel();
@@ -163,14 +163,6 @@ pub fn start_or_attach(command:&mut Command, port:u16, resp_tx:Sender<PWorkerRes
                 let h_state = state.clone();
                 let h_fstate = fstate.clone();
                 let hb_handler = move |req: Request, mut res: Response| {
-                    let state = h_state.as_ref();
-                    let s = &(*(*state));
-                    let fstate = h_fstate.as_ref();
-                    let fs = &(*(*fstate));
-
-                    let ws = PWorkerResponse::WorkerAlive(s.clone(),fs.clone());
-                    println!("handler ws: {:?}", ws);
-
                     match req.uri {
                         RequestUri::AbsolutePath(p) => {
                             if p.contains("parent_pid=") {
@@ -181,8 +173,6 @@ pub fn start_or_attach(command:&mut Command, port:u16, resp_tx:Sender<PWorkerRes
                                     let l_tx = h_tx.lock().unwrap();
                                     l_tx.send(new_pid).unwrap();
                                 }
-                            } else {
-                                println!("unknown req: {}", p)
                             }
                         },
                         x => panic!("bizzaro request: {}", x)
@@ -193,6 +183,12 @@ pub fn start_or_attach(command:&mut Command, port:u16, resp_tx:Sender<PWorkerRes
                         let headers = res.headers_mut();
                         headers.set(header::Connection(vec![header::ConnectionOption::Close]));
                     }
+
+                    let state = h_state.lock().ok().expect("failed to lock state in handler");
+                    let fstate = h_fstate.lock().ok().expect("failed to lock fstate in handler");
+
+                    let ws = PWorkerResponse::WorkerAlive((*(*state)).clone() ,(*(*fstate)).clone());
+                    println!("handler ws: {:?}", ws);
 
                     let _ = res.send("PWorker running".as_bytes());
                 };
@@ -236,58 +232,42 @@ pub fn start_or_attach(command:&mut Command, port:u16, resp_tx:Sender<PWorkerRes
                     let par_alive = unsafe { libc::kill(ppid, 0) } == 0;
                     println!("pworker state: {:?}; par alive: {}", state, par_alive);
 
+                    // clone the states to make the check logic easier to deal with
+                    let old_fstate = *(fstate.lock().ok().expect("Failed to lock fstate prior to state update")).clone();
+                    let old_state = *(state.lock().ok().expect("Failed to lock state prior to state update")).clone();
+
                     let new_state = {
-                        let s_mut = Arc::get_mut(&mut state);
-                        if s_mut.is_none() {
-                            panic!("can't get mut state");
+                        if par_alive {
+                            match old_state {
+                                // always reset to connected if parent alive
+                                PWorkerState::Connected(_)
+                                | PWorkerState::Disconnected(_)
+                                | PWorkerState::JustLaunched => PWorkerState::Connected(ppid)
+                            }
+                        } else {
+                            // parent disconnected
+                            match old_state {
+                                PWorkerState::JustLaunched
+                                | PWorkerState::Connected(_) => PWorkerState::Disconnected(5),
+                                PWorkerState::Disconnected(n) if n > 0 => PWorkerState::Disconnected(n-1),
+                                PWorkerState::Disconnected(0) => terminate(&old_fstate),
+                                // this is an illegal state, reset to something legal
+                                PWorkerState::Disconnected(_) => PWorkerState::Disconnected(0)
+                            }
                         }
-                        let old_state = &*(*(s_mut.unwrap()));
-
-                        // update state.
-                        // break out the alive/nonalive cases so that I can have a straightforward
-                        // explicit-case match for each, without excessive guard clauses
-
-                            //match oldState {
-                                // Err(e) => panic!("error locking state! {}", e),
-                                // Ok(state) => {
-                                //     *(*(*state)) =
-                                    if par_alive {
-                                        match *old_state {
-                                            // always reset to connected if parent alive
-                                            PWorkerState::Connected
-                                            | PWorkerState::Disconnected(_)
-                                            | PWorkerState::JustLaunched => PWorkerState::Connected
-                                        }
-                                    } else {
-                                        // parent disconnected
-                                        match *old_state {
-                                            PWorkerState::JustLaunched
-                                            | PWorkerState::Connected => PWorkerState::Disconnected(5),
-                                            PWorkerState::Disconnected(n) if n > 0 => PWorkerState::Disconnected(n-1),
-                                            PWorkerState::Disconnected(0) => {
-                                                    println!("terminate!");
-                                                    //terminate(*fstate)
-                                                    PWorkerState::Disconnected(0)
-                                                },
-                                            // this is an illegal state, reset to something legal
-                                            PWorkerState::Disconnected(_) => PWorkerState::Disconnected(0)
-                                        }
-                                    }
-    //                            }
-                            //};
                     };
-                    *(*Arc::get_mut(&mut state).unwrap()) = new_state;
-
 
                     // spawn the follower if its ok to do so
-                    // if let PWorkerState::Connected = state {
-                    //     if let FollowerState::NotSpawned = fstate {
-                    //         match spawn_follower(command) {
-                    //             Err(e) => println!("Unable to spawn follower: {}", e),
-                    //             Ok(fpid) => fstate = FollowerState::Spawned(fpid)
-                    //         }
-                    //     }
-                    // }
+                    if let PWorkerState::Connected(_) = new_state {
+                        if let FollowerState::NotSpawned = old_fstate {
+                            match spawn_follower(command) {
+                                Err(e) => println!("Unable to spawn follower: {}", e),
+                                Ok(fpid) => *(*(fstate.lock().ok().expect("failed to lock fstate for update"))) = FollowerState::Spawned(fpid)
+                            }
+                        }
+                    }
+
+                    *(*(state.lock().ok().expect("failed to lock state for update"))) = new_state;
 
                     thread::sleep(time::Duration::from_millis(1000));
                 }
