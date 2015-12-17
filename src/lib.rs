@@ -37,11 +37,17 @@ pub enum FollowerState {
 }
 
 #[derive(Debug,Clone,RustcDecodable,RustcEncodable,PartialEq)]
+pub enum ErrorResponse {
+    Connect(String),
+    Generic(String)
+}
+
+#[derive(Debug,Clone,RustcDecodable,RustcEncodable,PartialEq)]
 pub enum PWorkerResponse {
     NoResponseYet,
     WorkerAlive(PWorkerState, FollowerState),
     AttachedToExistingWorker,
-    GenericError(String),
+    Error(ErrorResponse),
 }
 
 pub fn spawn_follower(command: &mut Command) -> io::Result<u32> {
@@ -49,6 +55,54 @@ pub fn spawn_follower(command: &mut Command) -> io::Result<u32> {
     let child = command.spawn();
     let child = try!(child);
     Ok(child.id())
+}
+
+pub fn try_set_parent(ppid:i32, port: u16) -> Result<(), ErrorResponse> {
+    let pweb = format!("http://127.0.0.1:{}/?parent_pid={}", port, ppid);
+    println!("pworker url: {}", pweb);
+    let client = Client::new();
+
+    // this sets the new parent, and also by the way makes sure that we can connect
+    // to the pworker's web server.
+    // sometimes, in fact, the connect will hang even if the pworker is alive.
+    // so we do the check in a separate thread, and time out after a period if no connection
+    // is made.
+
+    // we'll use a channel here to get success or failure from the thread
+    let (tx,rx) = channel();
+
+    let ttx = tx.clone();
+    thread::spawn(move || {
+        match client.get(&pweb)
+                    .header(Connection::close())
+                    .send() {
+            Err(e) => {
+                // the port is bound but we couldn't set a new parent. error
+                let msg = format!("Port bound but unable to connect to existing pworker: {}",
+                                  e);
+                let _ = ttx.send(msg);
+            }
+            Ok(_) => { let _ = ttx.send("".to_owned()); }
+        }
+    });
+
+    for _ in 1..25 {
+        let msg = rx.try_recv();
+        if msg.is_err() {
+            thread::sleep(time::Duration::from_millis(10));
+        } else {
+            let msg = msg.unwrap();
+            if msg == "" {
+                return Ok(())
+            } else {
+                return Err(ErrorResponse::Connect(msg))
+            }
+        }
+    }
+
+    // timeout, return error
+    let msg = format!("Port bound, but timed out trying to connect to pworker");
+    return Err(ErrorResponse::Connect(msg))
 }
 
 pub fn start_or_attach(command: &mut Command, port: u16, resp_tx: Option<Sender<PWorkerResponse>>, follower_timeout: u32) {
@@ -90,24 +144,17 @@ pub fn start_or_attach(command: &mut Command, port: u16, resp_tx: Option<Sender<
     let set_new_parent =
         // only do this if we know port is bound, to avoid possible connection hang
         if port_bound {
-        let pweb = format!("http://127.0.0.1:{}/?parent_pid={}", port, ppid);
-        println!("pworker url: {}", pweb);
-
-        match client.get(&pweb)
-                    .header(Connection::close())
-                    .send() {
-            Err(e) => {
-                // the port is bound but we couldn't set a new parent. error
-                let msg = format!("Port bound but unable to connect to existing pworker: {}",
-                                  e);
-                let _ = resp_tx.send(PWorkerResponse::GenericError(msg));
-                return;
+            match try_set_parent(ppid, port) {
+                Err(e) => {
+                    let _ = resp_tx.send(PWorkerResponse::Error(e));
+                    return;
+                },
+                Ok(_) => true
             }
-            Ok(_) => true,
         }
-    } else {
-        false
-    };
+        else {
+            false
+        };
     println!("set parent: {}", set_new_parent);
 
     // spawn thread to monitor pworker http server and replicate messages on
@@ -134,7 +181,7 @@ pub fn start_or_attach(command: &mut Command, port: u16, resp_tx: Option<Sender<
                             let msg = format!("Unable to connect to pworker after {} attempts: {}",
                                               fail_count,
                                               e);
-                            let _ = resp_tx.send(PWorkerResponse::GenericError(msg));
+                            let _ = resp_tx.send(PWorkerResponse::Error(ErrorResponse::Generic(msg)));
                             break;
                         }
                     }
@@ -389,6 +436,9 @@ mod tests {
                             format!("expected follower pid {} to be alive, but it isn't", fpid));
 
                     got_alive = true;
+                }
+                if let PWorkerResponse::Error(x) = m {
+                    panic!("unexpected pworker error {:?}", x);
                 }
                 println!("pworker message: {:?}", m)
             }
