@@ -315,7 +315,13 @@ mod tests {
     use std::env;
     use std::time;
     use std::thread;
-    use std::sync::mpsc::{channel, Sender, Receiver};
+    use std::sync::mpsc::{channel};
+
+    extern crate libc;
+
+    use super::PWorkerResponse;
+    use super::PWorkerState;
+    use super::FollowerState;
 
     fn get_testproc_path() -> PathBuf {
         let mut wd = env::current_dir().unwrap();
@@ -332,21 +338,38 @@ mod tests {
 
     #[test]
     fn test_basic() {
+        // make sure that we can spawn a pworker, it can spawn a follower, and we can
+        // get messages from it.  this does NOT check that the pworker kills the follower
+        // after we exit.  need an another executable that can exit to check that.
         let tp = get_testproc_path();
+
+        let my_pid = unsafe { libc::getpid() };
 
         let mut tp_command = Command::new(&tp);
         let (tx, rx) = channel();
         super::start_or_attach(&mut tp_command, 16550, tx);
-        let scount = 5;
-        for i in 1..scount {
+        let scount = 10;
+        let mut got_alive = false;
+        for _ in 1..scount {
             while let Ok(m) = rx.try_recv() {
+                if let PWorkerResponse::WorkerAlive(PWorkerState::Connected(conpid), FollowerState::Spawned(fpid)) = m {
+                    assert!(conpid == my_pid, "expected my pid but got a different one");
+
+                    // kill the foller with sig 0 to make sure it is really alive
+                    let f_alive = unsafe { libc::kill(fpid as i32,0) } == 0;
+                    assert!(f_alive, format!("expected follower pid {} to be alive, but it isn't", fpid));
+
+                    got_alive = true;
+                }
                 println!("pworker message: {:?}", m)
+            }
+
+            if got_alive {
+                break;
             }
             thread::sleep(time::Duration::from_millis(1000));
         }
 
-        // TODO: actually assert something once the backchannel is going
-
-
+        assert!(got_alive, "should have received alive message");
     }
 }
