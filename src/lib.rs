@@ -51,7 +51,7 @@ pub fn spawn_follower(command: &mut Command) -> io::Result<u32> {
     Ok(child.id())
 }
 
-pub fn start_or_attach(command: &mut Command, port: u16, resp_tx: Option<Sender<PWorkerResponse>>) {
+pub fn start_or_attach(command: &mut Command, port: u16, resp_tx: Option<Sender<PWorkerResponse>>, follower_timeout: u32) {
     let resp_tx = match resp_tx {
         None => {
             let (tx,_) = channel();
@@ -293,7 +293,7 @@ pub fn start_or_attach(command: &mut Command, port: u16, resp_tx: Option<Sender<
                             // parent disconnected
                             match old_state {
                                 PWorkerState::JustLaunched |
-                                PWorkerState::Connected(_) => PWorkerState::Disconnected(5),
+                                PWorkerState::Connected(_) => PWorkerState::Disconnected(follower_timeout),
                                 PWorkerState::Disconnected(n) if n > 0 => {
                                     PWorkerState::Disconnected(n - 1)
                                 }
@@ -373,7 +373,8 @@ mod tests {
 
         let mut tp_command = Command::new(&tp);
         let (tx, rx) = channel();
-        super::start_or_attach(&mut tp_command, 16550, Some(tx));
+        let timeout = 5;
+        super::start_or_attach(&mut tp_command, 16550, Some(tx), timeout);
         let scount = 10;
         let mut got_alive = false;
         for _ in 1..scount {
