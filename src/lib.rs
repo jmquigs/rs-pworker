@@ -51,8 +51,15 @@ pub fn spawn_follower(command: &mut Command) -> io::Result<u32> {
     Ok(child.id())
 }
 
-pub fn start_or_attach(command: &mut Command, port: u16, resp_tx: Sender<PWorkerResponse>) {
-    let resp_tx = resp_tx.clone();
+pub fn start_or_attach(command: &mut Command, port: u16, resp_tx: Option<Sender<PWorkerResponse>>) {
+    let resp_tx = match resp_tx {
+        None => {
+            let (tx,_) = channel();
+            tx
+        },
+        Some(tx) => tx
+    };
+    resp_tx.clone();
 
     // connect to existing pworker, pass my pid
     let mut ppid = unsafe { libc::getpid() };
@@ -366,7 +373,7 @@ mod tests {
 
         let mut tp_command = Command::new(&tp);
         let (tx, rx) = channel();
-        super::start_or_attach(&mut tp_command, 16550, tx);
+        super::start_or_attach(&mut tp_command, 16550, Some(tx));
         let scount = 10;
         let mut got_alive = false;
         for _ in 1..scount {
